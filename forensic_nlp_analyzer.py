@@ -32,6 +32,12 @@ import matplotlib.gridspec as gridspec
 from matplotlib.ticker import MaxNLocator
 from datetime import datetime
 
+try:
+    from wordcloud import WordCloud
+    WORDCLOUD_AVAILABLE = True
+except ImportError:
+    WORDCLOUD_AVAILABLE = False
+
 # ── AI / NLP ──────────────────────────────────────────────────────────────────
 from transformers import pipeline
 
@@ -51,6 +57,7 @@ SAMPLE_SIZE = 200
 
 OUTPUT_FLAGGED_CSV = "investigator_review_list.csv"
 OUTPUT_JSON        = "analysis_results.json"
+OUTPUT_HTML        = "investigator_report.html"
 
 # Labels for zero-shot classification
 THREAT_LABELS = ["threatening and dangerous", "suspicious activity", "safe and benign"]
@@ -65,7 +72,7 @@ SLANG_MAP = {
 
 # High-Risk Keywords (Used to verify AI claims)
 CRITICAL_KEYWORDS = [
-    "kill", "shoot", "bomb", "attack", "murder", "death", "die", 
+    "kill", "shoot", "bomb", "attack", "murder", "death", "die",
     "destroy", "weapon", "gun", "knife", "threat", "hurt"
 ]
 
@@ -172,16 +179,16 @@ def clean_text(text: str) -> str:
     Returns lowercase, clean text.
     """
     text = re.sub(r"http\S+|www\.\S+", "", text)         # 1. URLs
-    text = re.sub(r"[@#](\w+)", r"\1", text)                    # 2. @mentions / #hashtags
+    text = re.sub(r"[@#](\w+)", r"\1", text)             # 2. @mentions / #hashtags
     text = text.encode("ascii", "ignore").decode("ascii") # 3. Emojis / non-ASCII
     text = re.sub(r"&\w+;", " ", text)                    # 4. HTML entities
     text = re.sub(r"[^a-zA-Z0-9\s.,!?'-]", "", text)     # 5. Special characters
-    text = re.sub(r"\s+", " ", text).strip()              # 6. Whitespace
+    text = re.sub(r"\s+", " ", text).strip().lower()      # 6. Whitespace + lowercase
     words = text.split()
     normalized_words = [SLANG_MAP.get(w, w) for w in words]
     text = " ".join(normalized_words)
 
-    return text.lower()
+    return text
 
 
 # ── Step 3: AI Classification + Confidence Tiers ─────────────────────────────
@@ -204,26 +211,37 @@ def assign_tier(threat_score: float) -> str:
         return "LOW"
 
 
-def classify_posts(df: pd.DataFrame, classifier, sentiment_pipe) -> pd.DataFrame:
+def classify_posts(df: pd.DataFrame, classifier, sentiment_pipe,
+                   ner_pipe=None, emotion_pipe=None) -> pd.DataFrame:
     """
     Runs a multi-stage forensic pipeline:
-    1. Preprocessing & Slang Normalization (Step 5)
-    2. Short-text guard
-    3. Sentiment Triage: Skips highly positive posts (Step 3)
-    4. AI Zero-Shot Classification
-    5. Keyword Verification: Prevents false-positive CRITICAL flags (Step 4)
+    0. Batch pre-clean all texts + batch sentiment triage
+    1. Short-text guard
+    2. Sentiment triage (skip highly positive posts)
+    3. AI zero-shot classification (BART)
+    4. Keyword anchoring / verification
+    5. NER + emotion detection on all FLAGGED posts
     """
     results = []
+    tier_icons = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"}
 
-    print("\n[AI] Classifying posts using Multi-Stage Forensic Pipeline...")
+    print("\n[AI] Pre-cleaning all texts and running batch sentiment analysis...")
+    all_originals = [str(row["post_text"]) for _, row in df.iterrows()]
+    all_cleaned   = [clean_text(t) for t in all_originals]
+
+    # Batch sentiment — much faster than one-by-one inference
+    sentiment_results = sentiment_pipe(all_cleaned, batch_size=32, truncation=True)
+
+    print("[AI] Classifying posts using Multi-Stage Forensic Pipeline...")
     print("-" * 80)
+    total = len(df)
 
-    for _, row in df.iterrows():
-        original_text = str(row["post_text"])
-        
-        # --- STAGE 0: CLEANING & SLANG NORMALIZATION (Step 5) ---
-        # clean_text() should now include the SLANG_MAP logic
-        cleaned = clean_text(original_text)
+    for idx, (_, row) in enumerate(df.iterrows()):
+        original_text = all_originals[idx]
+        cleaned       = all_cleaned[idx]
+        sent          = sentiment_results[idx]
+
+        print(f"  [{idx + 1:>4} / {total}]", end="  ")
 
         # --- STAGE 1: SHORT-TEXT GUARD ---
         word_count = len(cleaned.split())
@@ -233,57 +251,76 @@ def classify_posts(df: pd.DataFrame, classifier, sentiment_pipe) -> pd.DataFrame
                 "original_text": original_text, "clean_text": cleaned,
                 "top_label": "safe and benign", "threat_score": 0.0,
                 "safe_score": 1.0, "tier": "LOW", "status": "SAFE",
+                "emotion": "—", "entities": "—",
                 "note": f"skipped — short text ({word_count}w)"
             })
-            print(f"  🟢 [LOW     ] {row['user_id']} | score=0.00 (short) | {original_text}...")
+            print(f"🟢 [LOW     ] {row['user_id']} | score=0.00 (short) | {original_text[:60]}...")
             continue
 
-        # --- STAGE 2: SENTIMENT TRIAGE (Step 3) ---
-        # If a post is overwhelmingly positive, we skip the expensive threat AI.
-        # This fixes "Wicked!!" or "Killing it!" false positives.
-        sent = sentiment_pipe(cleaned)[0]
+        # --- STAGE 2: SENTIMENT TRIAGE ---
         if sent['label'] == 'POSITIVE' and sent['score'] > 0.85:
             results.append({
                 "user_id": row["user_id"], "timestamp": row["timestamp"],
                 "original_text": original_text, "clean_text": cleaned,
                 "top_label": "safe and benign", "threat_score": 0.1,
                 "safe_score": sent['score'], "tier": "LOW", "status": "SAFE",
-                "note": "Stage 1: High Positive Sentiment"
+                "emotion": "—", "entities": "—",
+                "note": "Stage 2: High Positive Sentiment"
             })
-            print(f"  🟢 [LOW     ] {row['user_id']} | score=0.10 (Positive) | {original_text}...")
+            print(f"🟢 [LOW     ] {row['user_id']} | score=0.10 (Positive) | {original_text[:60]}...")
             continue
 
         # --- STAGE 3: AI ZERO-SHOT INFERENCE ---
         prediction = classifier(
             cleaned,
             candidate_labels=THREAT_LABELS,
-            hypothesis_template="This text expresses a specific intent of {}." 
+            hypothesis_template="This text expresses a specific intent of {}."
         )
-        scores = dict(zip(prediction["labels"], prediction["scores"]))
+        scores    = dict(zip(prediction["labels"], prediction["scores"]))
         top_label = prediction["labels"][0]
-        
-        # Combine P(threatening) + P(suspicious)
+
         threat_score = (scores.get("threatening and dangerous", 0) +
                         scores.get("suspicious activity", 0))
 
-        # --- STAGE 4: KEYWORD ANCHORING / VERIFICATION (Step 4) ---
-        # AI often confuses "venting" (smelly bus) with "threats."
-        # We verify CRITICAL flags against a forensic keyword list.
+        # --- STAGE 4: KEYWORD ANCHORING / VERIFICATION ---
         tier = assign_tier(threat_score)
-        has_critical_word = any(word in cleaned for word in CRITICAL_KEYWORDS)
+        has_critical_word = any(
+            re.search(r'\b' + re.escape(kw) + r'\b', cleaned)
+            for kw in CRITICAL_KEYWORDS
+        )
         note = ""
 
         if tier == "CRITICAL" and not has_critical_word:
-            tier = "MEDIUM"  # Downgrade if it's just someone complaining loudly
+            tier   = "MEDIUM"
             status = "FLAGGED"
-            note = "AI flagged CRITICAL but no violent keywords found; downgraded to MEDIUM."
+            note   = "AI flagged CRITICAL but no violent keywords found; downgraded to MEDIUM."
         elif has_critical_word and threat_score > 0.5:
-            # If it has a keyword and even a moderate score, boost the priority
-            if tier == "LOW": tier = "MEDIUM"
-            note = "Verified: Contains high-risk forensic keywords."
+            if tier == "LOW":
+                tier = "MEDIUM"
+            note   = "Verified: Contains high-risk forensic keywords."
             status = "FLAGGED"
         else:
             status = "SAFE" if tier == "LOW" else "FLAGGED"
+
+        # --- STAGE 5: NER + EMOTION (all FLAGGED posts) ---
+        emotion_label = "—"
+        entities_str  = "—"
+
+        if status == "FLAGGED":
+            if emotion_pipe is not None:
+                emo = emotion_pipe(cleaned[:512])[0]
+                emotion_label = f"{emo['label']} ({emo['score']:.2f})"
+
+            if ner_pipe is not None:
+                ner_result = ner_pipe(original_text[:512])
+                entities = [
+                    f"{e['word']} ({e['entity_group']})"
+                    for e in ner_result
+                    if e['entity_group'] in ('PER', 'LOC', 'ORG')
+                ]
+                entities_str = ", ".join(entities) if entities else "none detected"
+                if entities_str != "none detected":
+                    note += f" | Entities: {entities_str}"
 
         results.append({
             "user_id":       row["user_id"],
@@ -295,12 +332,13 @@ def classify_posts(df: pd.DataFrame, classifier, sentiment_pipe) -> pd.DataFrame
             "safe_score":    round(scores.get("safe and benign", 0), 4),
             "tier":          tier,
             "status":        status,
+            "emotion":       emotion_label,
+            "entities":      entities_str,
             "note":          note,
         })
 
-        # Console Logging
-        tier_icons = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"}
-        print(f"  {tier_icons[tier]} [{tier:8s}] {row['user_id']} | score={threat_score:.2f} | {original_text}...")
+        print(f"{tier_icons[tier]} [{tier:8s}] {row['user_id']} | score={threat_score:.2f} "
+              f"| emo={emotion_label.split('(')[0].strip():10s} | {original_text[:50]}...")
 
     return pd.DataFrame(results)
 
@@ -325,7 +363,92 @@ def export_results(df: pd.DataFrame) -> pd.DataFrame:
     return flagged
 
 
-# ── Step 5: Live Matplotlib Dashboard ────────────────────────────────────────
+# ── Step 5: HTML Investigator Report ─────────────────────────────────────────
+def export_html(df: pd.DataFrame, path: str = OUTPUT_HTML):
+    """
+    Generates a colour-coded HTML report of all flagged posts.
+    Opens in any browser — far more readable than a raw CSV for presentation.
+    """
+    TIER_HEX = {
+        "CRITICAL": COL_RED,
+        "HIGH":     COL_ORANGE,
+        "MEDIUM":   COL_AMBER,
+        "LOW":      COL_GREEN,
+    }
+
+    flagged = df[df["status"] == "FLAGGED"].copy()
+    tier_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+    flagged["_sort"] = flagged["tier"].map(tier_order)
+    flagged = flagged.sort_values(["_sort", "threat_score"], ascending=[True, False]).drop(columns=["_sort"])
+
+    rows_html = ""
+    for _, r in flagged.iterrows():
+        color = TIER_HEX.get(r["tier"], "#ffffff")
+        rows_html += (
+            f'<tr style="border-left:4px solid {color}">'
+            f'<td style="white-space:nowrap">{r["user_id"]}</td>'
+            f'<td style="color:{color};font-weight:bold">{r["tier"]}</td>'
+            f'<td style="text-align:center">{r["threat_score"]:.3f}</td>'
+            f'<td>{r["original_text"]}</td>'
+            f'<td style="white-space:nowrap">{r.get("emotion", "—")}</td>'
+            f'<td style="font-size:0.85em">{r.get("entities", "—")}</td>'
+            f'<td style="font-size:0.8em;color:#8b949e">{r.get("note", "")}</td>'
+            f'</tr>\n'
+        )
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Forensic Investigator Report</title>
+  <style>
+    body  {{ background:#0d1117; color:#e6edf3; font-family:monospace; padding:24px; margin:0 }}
+    h1    {{ color:#58a6ff; margin-bottom:4px; font-size:1.3em }}
+    p.sub {{ color:#8b949e; font-size:0.85em; margin-top:0 }}
+    table {{ border-collapse:collapse; width:100%; margin-top:16px }}
+    thead tr {{ background:#161b22 }}
+    th    {{ padding:10px 12px; text-align:left; color:#8b949e;
+             font-size:0.8em; text-transform:uppercase; letter-spacing:0.05em }}
+    td    {{ padding:8px 12px; border-bottom:1px solid #21262d; vertical-align:top }}
+    tr:hover td {{ background:#161b22 }}
+    .tag-c {{ background:{COL_RED};    color:#fff; border-radius:4px; padding:2px 6px; font-size:0.75em }}
+    .tag-h {{ background:{COL_ORANGE}; color:#000; border-radius:4px; padding:2px 6px; font-size:0.75em }}
+    .tag-m {{ background:{COL_AMBER};  color:#000; border-radius:4px; padding:2px 6px; font-size:0.75em }}
+  </style>
+</head>
+<body>
+  <h1>Digital Forensics — Investigator Review List</h1>
+  <p class="sub">
+    Model: facebook/bart-large-mnli &nbsp;|&nbsp;
+    Dataset: VADER/ICWSM 2014 &nbsp;|&nbsp;
+    Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} &nbsp;|&nbsp;
+    Flagged posts: {len(flagged)}
+  </p>
+  <table>
+    <thead>
+      <tr>
+        <th>User</th>
+        <th>Tier</th>
+        <th>Score</th>
+        <th>Original Post</th>
+        <th>Emotion</th>
+        <th>Entities (NER)</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+{rows_html}
+    </tbody>
+  </table>
+</body>
+</html>"""
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"[✓] HTML report            → {path}")
+
+
+# ── Step 6: Live Matplotlib Dashboard ────────────────────────────────────────
 def show_charts(df: pd.DataFrame):
     """
     Displays a 4-panel forensic analysis dashboard.
@@ -333,7 +456,8 @@ def show_charts(df: pd.DataFrame):
     Panel 1 (top-left)   — Donut chart: four-tier post breakdown
     Panel 2 (top-right)  — Histogram: threat score distribution with tier bands
     Panel 3 (bottom-left)— Horizontal bar: top 15 posts ranked by threat score
-    Panel 4 (bottom-right)— Scatter: threat score vs safe score, coloured by tier
+    Panel 4 (bottom-right)— Word cloud of most frequent terms in CRITICAL+HIGH posts
+                            (falls back to scatter plot if wordcloud not installed)
     """
     plt.rcParams.update({
         "figure.facecolor":  BG_DARK,
@@ -473,41 +597,50 @@ def show_charts(df: pd.DataFrame):
     legend_patches = [mpatches.Patch(color=TIER_COLOURS[t], label=t) for t in tiers]
     ax3.legend(handles=legend_patches, loc="lower right", fontsize=8)
 
-    # ── Panel 4: Scatter — threat vs safe, coloured by tier ───────────────────
-    for tier in ["LOW", "MEDIUM", "HIGH", "CRITICAL"]:
-        subset = df[df["tier"] == tier]
-        if subset.empty:
-            continue
-        marker = "D" if tier in ("HIGH", "CRITICAL") else "o"
-        ax4.scatter(
-            subset["threat_score"], subset["safe_score"],
-            color=TIER_COLOURS[tier], alpha=0.85,
-            s=80 if tier in ("HIGH", "CRITICAL") else 55,
-            edgecolors=BG_DARK, linewidth=0.5,
-            marker=marker, label=tier, zorder=3
-        )
+    # ── Panel 4: Word cloud — threat vocabulary of CRITICAL + HIGH posts ─────
+    flagged_text = " ".join(
+        df[df["tier"].isin(["CRITICAL", "HIGH"])]["clean_text"].tolist()
+    )
 
-    for threshold in [TIER_MEDIUM, TIER_HIGH, TIER_CRITICAL]:
-        ax4.axvline(threshold, color=COL_MUTED, linewidth=0.8,
-                    linestyle="--", alpha=0.6, zorder=2)
-
-    # Annotate critical posts
-    for _, r in df[df["tier"] == "CRITICAL"].iterrows():
-        ax4.annotate(
-            r["user_id"],
-            xy=(r["threat_score"], r["safe_score"]),
-            xytext=(r["threat_score"] - 0.20, r["safe_score"] + 0.04),
-            fontsize=6.5, color=COL_MUTED,
-            arrowprops=dict(arrowstyle="->", color=COL_MUTED, lw=0.6),
-        )
-
-    ax4.set_title("Threat Score vs Safe Score  (by Tier)")
-    ax4.set_xlabel("Threat Score →")
-    ax4.set_ylabel("← Safe Score")
-    ax4.set_xlim(-0.05, 1.05)
-    ax4.set_ylim(-0.05, 1.05)
-    ax4.legend(loc="upper right", fontsize=8)
-    ax4.grid(True)
+    if WORDCLOUD_AVAILABLE and flagged_text.strip():
+        wc = WordCloud(
+            width=900, height=420,
+            background_color=BG_DARK,
+            colormap="Reds",
+            max_words=60,
+            prefer_horizontal=0.85,
+        ).generate(flagged_text)
+        ax4.imshow(wc, interpolation="bilinear")
+        ax4.axis("off")
+        ax4.set_title("Most Frequent Terms in CRITICAL + HIGH Posts")
+    else:
+        # Fallback: scatter plot when wordcloud library is unavailable
+        for tier in ["LOW", "MEDIUM", "HIGH", "CRITICAL"]:
+            subset = df[df["tier"] == tier]
+            if subset.empty:
+                continue
+            marker = "D" if tier in ("HIGH", "CRITICAL") else "o"
+            ax4.scatter(
+                subset["threat_score"], subset["safe_score"],
+                color=TIER_COLOURS[tier], alpha=0.85,
+                s=80 if tier in ("HIGH", "CRITICAL") else 55,
+                edgecolors=BG_DARK, linewidth=0.5,
+                marker=marker, label=tier, zorder=3
+            )
+        for threshold in [TIER_MEDIUM, TIER_HIGH, TIER_CRITICAL]:
+            ax4.axvline(threshold, color=COL_MUTED, linewidth=0.8,
+                        linestyle="--", alpha=0.6, zorder=2)
+        ax4.set_title("Threat Score vs Safe Score  (by Tier)")
+        ax4.set_xlabel("Threat Score →")
+        ax4.set_ylabel("← Safe Score")
+        ax4.set_xlim(-0.05, 1.05)
+        ax4.set_ylim(-0.05, 1.05)
+        ax4.legend(loc="upper right", fontsize=8)
+        ax4.grid(True)
+        if not WORDCLOUD_AVAILABLE:
+            ax4.text(0.5, -0.12, "Install wordcloud for threat vocabulary panel",
+                     transform=ax4.transAxes, ha="center",
+                     fontsize=7.5, color=COL_MUTED)
 
     fig.text(
         0.5, 0.005,
@@ -533,26 +666,45 @@ def main():
 
     # Step 1 — Fetch live data from online source
     df = fetch_online_dataset(sample_size=SAMPLE_SIZE)
-    print("\n[AI] Loading Stage-1: Fast Sentiment Analyzer...")
-    sentiment_pipe = pipeline("sentiment-analysis", 
-                          model="distilbert-base-uncased-finetuned-sst-2-english", 
-                          device=-1)
 
+    # Step 2 — Load all AI models
+    print("\n[AI] Loading Stage-1: Fast Sentiment Analyzer (distilbert)...")
+    sentiment_pipe = pipeline(
+        "sentiment-analysis",
+        model="distilbert-base-uncased-finetuned-sst-2-english",
+        device=-1
+    )
 
-    # Step 2 — Load zero-shot classifier
-    print("\n[AI] Loading NLP model (facebook/bart-large-mnli)...")
+    print("[AI] Loading Stage-2: Zero-Shot Threat Classifier (facebook/bart-large-mnli)...")
     classifier = pipeline(
         "zero-shot-classification",
         model="facebook/bart-large-mnli",
         device=-1   # -1 = CPU; set to 0 for GPU
     )
-    print("[✓] Model loaded.")
+
+    print("[AI] Loading Stage-3: Named Entity Recognition (dslim/bert-base-NER)...")
+    ner_pipe = pipeline(
+        "ner",
+        model="dslim/bert-base-NER",
+        aggregation_strategy="simple",
+        device=-1
+    )
+
+    print("[AI] Loading Stage-4: Emotion Classifier (j-hartmann/emotion-english-distilroberta-base)...")
+    emotion_pipe = pipeline(
+        "text-classification",
+        model="j-hartmann/emotion-english-distilroberta-base",
+        device=-1
+    )
+
+    print("[✓] All models loaded.\n")
 
     # Step 3 — Preprocess and classify with tier assignment
-    results_df = classify_posts(df, classifier, sentiment_pipe)
+    results_df = classify_posts(df, classifier, sentiment_pipe, ner_pipe, emotion_pipe)
 
-    # Step 4 — Export
+    # Step 4 — Export CSV + JSON + HTML
     export_results(results_df)
+    export_html(results_df)
 
     # Step 5 — Summary
     tier_counts = results_df["tier"].value_counts()
@@ -574,6 +726,7 @@ def main():
     print(f"\n  Output files:")
     print(f"    → {OUTPUT_FLAGGED_CSV}")
     print(f"    → {OUTPUT_JSON}")
+    print(f"    → {OUTPUT_HTML}")
     print(f"    → forensic_dashboard.png")
     print("=" * 70)
 
