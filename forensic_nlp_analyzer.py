@@ -16,8 +16,8 @@ Rubric alignment:
   - Contribution:        Outputs prioritised investigator_review_list.csv with 4-tier risk levels
   - Presentation:        4-panel live matplotlib dashboard (plt.show())
 
-Author:  [Your Name]
-Date:    May 2026
+Author:  Marco Geral, Ethan Wilke and Chisom Emekpo
+Date:    24 May 2026
 """
 
 import re
@@ -84,7 +84,6 @@ CRITICAL_KEYWORDS = [
 #   MEDIUM     ≥ 0.65  — ambiguous; secondary review
 #   LOW        < 0.65  — likely benign; de-prioritised
 #
-# Why these values?
 # The facebook/bart-large-mnli model produces a noisy baseline on short, ambiguous,
 # or topic-neutral text — it tends to hedge toward "suspicious activity" when it
 # cannot find a clear safe signal, inflating scores for posts like conference tweets
@@ -196,10 +195,10 @@ def assign_tier(threat_score: float) -> str:
     """
     Maps a combined threat score (0.0–1.0) to one of four confidence tiers.
 
-    CRITICAL  ≥ 0.90  — overtly threatening
-    HIGH      ≥ 0.80  — strongly suspicious
-    MEDIUM    ≥ 0.65  — ambiguous / borderline
-    LOW        < 0.65  — likely benign
+    CRITICAL  ≥ 0.90  - overtly threatening
+    HIGH      ≥ 0.80  - strongly suspicious
+    MEDIUM    ≥ 0.65  - ambiguous / borderline
+    LOW        < 0.65  - likely benign
     """
     if threat_score >= TIER_CRITICAL:
         return "CRITICAL"
